@@ -1,21 +1,51 @@
 //! The window: a connection tree on the left, a video wall on the right.
 
-use crate::model::{Connection, Library, Node, Transport};
+use crate::model::{Connection, Library, Node, ThemePref, Transport};
 use crate::stream::{Player, Status};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ObjectFit,
-    ParentElement as _, RenderImage, SharedString, Styled as _, StyledImage as _, Task, Window,
-    div, img, px, relative,
+    ParentElement as _, RenderImage, SharedString, StatefulInteractiveElement as _, Styled as _,
+    StyledImage as _, Task, Window, div, img, px, relative, svg,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
 use gpui_component::list::ListItem;
+use gpui_component::theme::{Theme, ThemeMode};
 use gpui_component::tree::{TreeItem, TreeState, tree};
-use gpui_component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
+use gpui_component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
+use gpui_component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
+
+/// A tree row being dragged. Carries the label so the preview can show it
+/// without reaching back into the library.
+#[derive(Clone)]
+struct DraggedNode {
+    id: Uuid,
+    label: SharedString,
+}
+
+/// The chip that follows the cursor during a drag.
+struct DragPreview {
+    label: SharedString,
+}
+
+impl gpui::Render for DragPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
+            .text_xs()
+            .child(self.label.clone())
+    }
+}
 
 /// Roughly 30 fps. The decoders push frames into a mailbox; this is just how
 /// often we look.
@@ -78,7 +108,16 @@ impl PlayerApp {
             }
         });
 
-        let _ = window;
+        apply_theme(library.theme, window, cx);
+        // Only matters while the preference is System, but the subscription is
+        // cheap enough to hold unconditionally.
+        cx.observe_window_appearance(window, |this, window, cx| {
+            if this.library.theme == ThemePref::System {
+                Theme::sync_system_appearance(Some(window), cx);
+            }
+        })
+        .detach();
+
         let mut this = Self {
             library,
             tree,
@@ -92,6 +131,13 @@ impl PlayerApp {
             this.open_stream(connection);
         }
         this
+    }
+
+    fn cycle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.library.theme = self.library.theme.next();
+        apply_theme(self.library.theme, window, cx);
+        self.save_library();
+        cx.notify();
     }
 
     fn rebuild_tree(&mut self, cx: &mut Context<Self>) {
@@ -134,6 +180,37 @@ impl PlayerApp {
             None => {}
         }
         cx.notify();
+    }
+
+    /// Dropping onto a group moves into it; dropping onto a connection moves
+    /// alongside that connection, the way Zed's project panel behaves.
+    fn drop_onto(&mut self, dragged: Uuid, target: Uuid, cx: &mut Context<Self>) {
+        let new_parent = match self.library.find(target) {
+            Some(Node::Group { id, .. }) => Some(*id),
+            Some(Node::Stream(_)) => self.library.parent_of(target),
+            None => return,
+        };
+        self.move_node(dragged, new_parent, cx);
+    }
+
+    fn move_node(&mut self, dragged: Uuid, new_parent: Option<Uuid>, cx: &mut Context<Self>) {
+        if self.library.move_node(dragged, new_parent) {
+            self.save_library();
+            self.rebuild_tree(cx);
+        }
+    }
+
+    /// Hovering a collapsed group mid-drag opens it, so you can drop deeper
+    /// without letting go first.
+    fn expand_for_drag(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        let collapsed = matches!(
+            self.library.find(id),
+            Some(Node::Group { expanded: false, .. })
+        );
+        if collapsed {
+            self.library.set_expanded(id, true);
+            self.rebuild_tree(cx);
+        }
     }
 
     fn open_stream(&mut self, connection: Connection) {
@@ -347,6 +424,84 @@ impl PlayerApp {
     }
 }
 
+/// Right-click menu for a tree row. Groups can take new children; connections
+/// can be opened and edited.
+fn row_menu(
+    menu: PopupMenu,
+    id: Uuid,
+    is_group: bool,
+    this: &Entity<PlayerApp>,
+) -> PopupMenu {
+    let menu = if is_group {
+        menu.item(PopupMenuItem::new("New stream\u{2026}").on_click({
+            let this = this.clone();
+            move |_, window, app| {
+                this.update(app, |this, cx| {
+                    this.selected = Some(id);
+                    this.open_form(None, window, cx);
+                });
+            }
+        }))
+        .item(PopupMenuItem::new("New group").on_click({
+            let this = this.clone();
+            move |_, _, app| {
+                this.update(app, |this, cx| {
+                    this.selected = Some(id);
+                    this.add_group(cx);
+                });
+            }
+        }))
+        .item(PopupMenuItem::separator())
+        .item(PopupMenuItem::new("Rename\u{2026}").on_click({
+            let this = this.clone();
+            move |_, window, app| {
+                this.update(app, |this, cx| this.open_group_form(id, window, cx));
+            }
+        }))
+    } else {
+        menu.item(PopupMenuItem::new("Open").on_click({
+            let this = this.clone();
+            move |_, _, app| {
+                this.update(app, |this, cx| {
+                    if let Some(connection) = this.library.connection(id).cloned() {
+                        this.open_stream(connection);
+                        cx.notify();
+                    }
+                });
+            }
+        }))
+        .item(PopupMenuItem::new("Edit\u{2026}").on_click({
+            let this = this.clone();
+            move |_, window, app| {
+                this.update(app, |this, cx| {
+                    if let Some(connection) = this.library.connection(id).cloned() {
+                        this.open_form(Some(connection), window, cx);
+                    }
+                });
+            }
+        }))
+    };
+
+    menu.item(PopupMenuItem::separator())
+        .item(PopupMenuItem::new("Delete").on_click({
+            let this = this.clone();
+            move |_, window, app| {
+                this.update(app, |this, cx| {
+                    this.selected = Some(id);
+                    this.delete_selected(window, cx);
+                });
+            }
+        }))
+}
+
+fn apply_theme(pref: ThemePref, window: &mut Window, cx: &mut Context<PlayerApp>) {
+    match pref {
+        ThemePref::System => Theme::sync_system_appearance(Some(window), cx),
+        ThemePref::Light => Theme::change(ThemeMode::Light, Some(window), cx),
+        ThemePref::Dark => Theme::change(ThemeMode::Dark, Some(window), cx),
+    }
+}
+
 fn parent_of(nodes: &[Node], child: Uuid) -> Option<Uuid> {
     for node in nodes {
         let Node::Group { id, children, .. } = node else {
@@ -403,8 +558,6 @@ impl gpui::Render for PlayerApp {
 
 impl PlayerApp {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let has_selection = self.selected.is_some();
-
         v_flex()
             .w(px(272.0))
             .flex_none()
@@ -437,27 +590,111 @@ impl PlayerApp {
             )
             .child(
                 div()
+                    .id("tree-pane")
                     .flex_1()
                     .min_h_0()
+                    // Empty space below the rows is the top level, so a node can
+                    // be dragged out of every group.
+                    .on_drop::<DraggedNode>({
+                        let this = cx.entity();
+                        move |dragged, _, app| {
+                            let dragged = dragged.id;
+                            this.update(app, |this, cx| this.move_node(dragged, None, cx));
+                        }
+                    })
                     .child(tree(&self.tree, {
                         // The render closure only gets `&mut App`, so route
-                        // clicks back through a handle to this view.
+                        // clicks and drops back through a handle to this view.
                         let this = cx.entity();
+                        let muted = cx.theme().muted_foreground;
                         move |ix, entry, _selected, _window, _cx| {
                             let id = entry.item().id.parse::<Uuid>().ok();
-                            let marker = if entry.is_folder() {
-                                if entry.is_expanded() { "\u{25be}" } else { "\u{25b8}" }
+                            let is_group = entry.is_folder();
+                            let collapsed = is_group && !entry.is_expanded();
+                            let chevron = if entry.is_expanded() {
+                                "icons/chevron-down.svg"
                             } else {
-                                "\u{25cf}"
+                                "icons/chevron-right.svg"
                             };
+                            let glyph = match (is_group, entry.is_expanded()) {
+                                (true, true) => "icons/folder-open.svg",
+                                (true, false) => "icons/folder.svg",
+                                (false, _) => "icons/camera.svg",
+                            };
+                            let label = entry.item().label.clone();
                             let this = this.clone();
                             ListItem::new(ix)
                                 .pl(px(8.0 + 14.0 * entry.depth() as f32))
                                 .child(
-                                    h_flex()
+                                    div()
+                                        .id(("row", ix))
+                                        .w_full()
+                                        .flex()
                                         .gap_2()
-                                        .child(div().w(px(12.0)).text_xs().child(marker))
-                                        .child(entry.item().label.clone()),
+                                        .items_center()
+                                        // Leaves keep the chevron's width so their
+                                        // icons line up under the folder's.
+                                        .child(if is_group {
+                                            svg()
+                                                .path(chevron)
+                                                .size(px(12.0))
+                                                .flex_none()
+                                                .text_color(muted)
+                                                .into_any_element()
+                                        } else {
+                                            div().w(px(12.0)).flex_none().into_any_element()
+                                        })
+                                        .child(
+                                            svg()
+                                                .path(glyph)
+                                                .size(px(14.0))
+                                                .flex_none()
+                                                .text_color(muted),
+                                        )
+                                        .child(label.clone())
+                                        .when_some(id, |row, node_id| {
+                                            row.on_drag(
+                                                DraggedNode {
+                                                    id: node_id,
+                                                    label: label.clone(),
+                                                },
+                                                |dragged, _, _, cx| {
+                                                    let label = dragged.label.clone();
+                                                    cx.new(|_| DragPreview { label })
+                                                },
+                                            )
+                                            .drag_over::<DraggedNode>(|mut style, _, _, cx| {
+                                                style.background =
+                                                    Some(cx.theme().drop_target.into());
+                                                style
+                                            })
+                                            .on_drop::<DraggedNode>({
+                                                let this = this.clone();
+                                                move |dragged, _, app| {
+                                                    let dragged = dragged.id;
+                                                    this.update(app, |this, cx| {
+                                                        this.drop_onto(dragged, node_id, cx)
+                                                    });
+                                                }
+                                            })
+                                            .when(collapsed, |row| {
+                                                let this = this.clone();
+                                                row.on_drag_move::<DraggedNode>(
+                                                    move |_, _, app| {
+                                                        this.update(app, |this, cx| {
+                                                            this.expand_for_drag(node_id, cx)
+                                                        });
+                                                    },
+                                                )
+                                            })
+                                        })
+                                        .context_menu({
+                                            let this = this.clone();
+                                            move |menu, _, _| match id {
+                                                Some(id) => row_menu(menu, id, is_group, &this),
+                                                None => menu,
+                                            }
+                                        }),
                                 )
                                 .on_click(move |_, _window, app| {
                                     if let Some(id) = id {
@@ -483,34 +720,13 @@ impl PlayerApp {
                     .border_t_1()
                     .border_color(cx.theme().sidebar_border)
                     .child(
-                        h_flex()
-                            .gap_1()
-                            .child(
-                                Button::new("edit")
-                                    .label("Edit")
-                                    .outline()
-                                    .small()
-                                    .disabled(!has_selection)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        let Some(id) = this.selected else { return };
-                                        match this.library.connection(id).cloned() {
-                                            Some(connection) => {
-                                                this.open_form(Some(connection), window, cx)
-                                            }
-                                            None => this.open_group_form(id, window, cx),
-                                        }
-                                    })),
-                            )
-                            .child(
-                                Button::new("delete")
-                                    .label("Delete")
-                                    .danger()
-                                    .small()
-                                    .disabled(!has_selection)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.delete_selected(window, cx)
-                                    })),
-                            ),
+                        Button::new("theme")
+                            .label(self.library.theme.label())
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.cycle_theme(window, cx)
+                            })),
                     )
                     .when_some(self.error.clone(), |this, error| {
                         this.child(

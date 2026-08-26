@@ -11,10 +11,46 @@ mod stream;
 mod ui;
 
 use gpui::{
-    AnyView, AppContext as _, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions,
-    px, size,
+    AnyView, AppContext as _, Application, AssetSource, Bounds, SharedString, TitlebarOptions,
+    WindowBounds, WindowOptions, px, size,
 };
 use gpui_component::Root;
+use std::borrow::Cow;
+
+/// gpui resolves `svg().path(..)` through the app's asset source, and
+/// gpui-component ships no icons of its own, so carry ours in the binary.
+struct Assets;
+
+macro_rules! icon {
+    ($path:literal) => {
+        ($path, include_bytes!(concat!("../assets/", $path)).as_slice())
+    };
+}
+
+const ICONS: &[(&str, &[u8])] = &[
+    icon!("icons/chevron-right.svg"),
+    icon!("icons/chevron-down.svg"),
+    icon!("icons/folder.svg"),
+    icon!("icons/folder-open.svg"),
+    icon!("icons/camera.svg"),
+];
+
+impl AssetSource for Assets {
+    fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+        Ok(ICONS
+            .iter()
+            .find(|(name, _)| *name == path)
+            .map(|(_, bytes)| Cow::Borrowed(*bytes)))
+    }
+
+    fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
+        Ok(ICONS
+            .iter()
+            .filter(|(name, _)| name.starts_with(path))
+            .map(|(name, _)| SharedString::from(*name))
+            .collect())
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -30,7 +66,7 @@ fn main() {
         unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
     }
 
-    let app = Application::new();
+    let app = Application::new().with_assets(Assets);
 
     app.run(|cx| {
         gpui_component::init(cx);

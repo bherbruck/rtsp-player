@@ -79,11 +79,23 @@ without complaint.
 
 Two ways to get a Windows binary:
 
-- **CI** — `.github/workflows/windows.yml` builds on `windows-latest` on every
-  push to `main` and uploads `rtsp-player.exe` as an artifact. Run it manually
-  with `gh workflow run windows.yml`, then `gh run download` for the exe.
+- **Releases** — `.github/workflows/release.yml` builds each target on its own
+  runner when a `v*` tag is pushed, and attaches the binaries to the GitHub
+  release.
 - **Natively** — on the Windows side (including from WSL, where it is just the
   host OS), install Rust and run `cargo build --release`.
+
+## Releases
+
+Pushing a tag publishes binaries for Linux, Windows and macOS:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+The Linux binary is dynamically linked against the libraries listed above, so
+they must be installed to run it. macOS is built best-effort and is the one
+target that has never been tested.
 
 ## Run
 
@@ -102,13 +114,17 @@ you use anywhere else.
 
 ## Using it
 
-- **Add stream** — name, URL, optional username and password, TCP or UDP.
-- **Group** — creates a folder. New items go into whatever is selected, so
-  select a group first to add inside it.
 - **Click a connection** — opens it on the wall. Click a group to fold it.
-- **Edit / Delete** — act on the current selection; Edit renames a group or
-  reopens the form for a connection.
+- **Right-click a row** — Open, Edit and Delete on a connection; New stream,
+  New group, Rename and Delete on a group.
+- **Drag rows** — drop onto a group to move inside it, or onto a connection to
+  move alongside it. A collapsed group opens when you hover it mid-drag, and a
+  group cannot be dropped into itself.
+- **Add stream / Group** — same thing from the toolbar, adding inside whatever
+  is selected.
 - **✕ on a tile** — closes that stream.
+- **Theme button** — cycles Auto (follows the desktop), Light and Dark. Auto
+  keeps following the system if it changes while the app is open.
 
 TCP is the default transport and the right choice almost always. UDP is
 lower latency on a quiet LAN but `retina` has no reorder buffer, so any

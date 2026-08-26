@@ -95,6 +95,37 @@ impl Node {
 
 }
 
+/// Which appearance the window uses. `System` follows the desktop setting and
+/// keeps following it when the user changes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemePref {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemePref {
+    /// Cycles in the order the toggle button steps through.
+    pub fn next(self) -> Self {
+        match self {
+            ThemePref::System => ThemePref::Light,
+            ThemePref::Light => ThemePref::Dark,
+            ThemePref::Dark => ThemePref::System,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            // Half-filled circle, sun, moon.
+            ThemePref::System => "\u{25d0} Auto",
+            ThemePref::Light => "\u{2600} Light",
+            ThemePref::Dark => "\u{263e} Dark",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Library {
     #[serde(default)]
@@ -103,6 +134,8 @@ pub struct Library {
     /// launch so a monitoring wall comes back the way it was left.
     #[serde(default)]
     pub open: Vec<Uuid>,
+    #[serde(default)]
+    pub theme: ThemePref,
 }
 
 impl Library {
@@ -275,6 +308,45 @@ impl Library {
             false
         }
         walk(&mut self.roots, id, value);
+    }
+
+    /// Reparent `node` under `new_parent`, or to the top level when `None`.
+    /// Returns false when the move is not allowed or changes nothing.
+    pub fn move_node(&mut self, node: Uuid, new_parent: Option<Uuid>) -> bool {
+        if let Some(parent) = new_parent {
+            // Dropping a group into itself or one of its own descendants would
+            // detach that whole subtree from the tree.
+            if self.is_ancestor(node, parent) {
+                return false;
+            }
+        }
+        if self.parent_of(node) == new_parent {
+            return false;
+        }
+        let Some(detached) = self.remove(node) else {
+            return false;
+        };
+        self.insert(new_parent, detached);
+        true
+    }
+
+    /// The group holding `child`, or `None` when it sits at the top level.
+    pub fn parent_of(&self, child: Uuid) -> Option<Uuid> {
+        fn walk(nodes: &[Node], child: Uuid) -> Option<Uuid> {
+            for node in nodes {
+                let Node::Group { id, children, .. } = node else {
+                    continue;
+                };
+                if children.iter().any(|c| c.id() == child) {
+                    return Some(*id);
+                }
+                if let Some(found) = walk(children, child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        walk(&self.roots, child)
     }
 
     /// True when `ancestor` is `node` or contains it; used to reject moves that
