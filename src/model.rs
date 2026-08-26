@@ -126,6 +126,33 @@ impl ThemePref {
     }
 }
 
+/// How opening a connection affects the wall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LayoutMode {
+    /// Opening a stream replaces whatever is playing.
+    #[default]
+    Single,
+    /// Opening a stream adds another tile to the grid.
+    Multi,
+}
+
+impl LayoutMode {
+    pub fn toggled(self) -> Self {
+        match self {
+            LayoutMode::Single => LayoutMode::Multi,
+            LayoutMode::Multi => LayoutMode::Single,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LayoutMode::Single => "One",
+            LayoutMode::Multi => "Many",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Library {
     #[serde(default)]
@@ -136,6 +163,8 @@ pub struct Library {
     pub open: Vec<Uuid>,
     #[serde(default)]
     pub theme: ThemePref,
+    #[serde(default)]
+    pub layout: LayoutMode,
 }
 
 impl Library {
@@ -308,6 +337,26 @@ impl Library {
             false
         }
         walk(&mut self.roots, id, value);
+    }
+
+    /// Every connection at or below `id`, depth first, so a group can be
+    /// opened as a set.
+    pub fn connections_under(&self, id: Uuid) -> Vec<Connection> {
+        fn collect(node: &Node, out: &mut Vec<Connection>) {
+            match node {
+                Node::Stream(c) => out.push(c.clone()),
+                Node::Group { children, .. } => {
+                    for child in children {
+                        collect(child, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if let Some(node) = self.find(id) {
+            collect(node, &mut out);
+        }
+        out
     }
 
     /// Reparent `node` under `new_parent`, or to the top level when `None`.

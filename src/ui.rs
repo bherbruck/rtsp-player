@@ -1,6 +1,6 @@
 //! The window: a connection tree on the left, a video wall on the right.
 
-use crate::model::{Connection, Library, Node, ThemePref, Transport};
+use crate::model::{Connection, LayoutMode, Library, Node, ThemePref, Transport};
 use crate::stream::{Player, Status};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -23,6 +23,13 @@ use uuid::Uuid;
 /// without reaching back into the library.
 #[derive(Clone)]
 struct DraggedNode {
+    id: Uuid,
+    label: SharedString,
+}
+
+/// An open tile being dragged to a new position on the wall.
+#[derive(Clone)]
+struct DraggedTile {
     id: Uuid,
     label: SharedString,
 }
@@ -128,7 +135,7 @@ impl PlayerApp {
             _refresh: refresh,
         };
         for connection in restore {
-            this.open_stream(connection);
+            this.push_stream(connection);
         }
         this
     }
@@ -163,7 +170,7 @@ impl PlayerApp {
         }
     }
 
-    fn on_item_click(&mut self, id: Uuid, cx: &mut Context<Self>) {
+    fn on_item_click(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         self.selected = Some(id);
         match self.library.find(id) {
             Some(Node::Group { id, expanded, .. }) => {
@@ -175,7 +182,7 @@ impl PlayerApp {
             }
             Some(Node::Stream(connection)) => {
                 let connection = connection.clone();
-                self.open_stream(connection);
+                self.open_stream(connection, window);
             }
             None => {}
         }
@@ -213,7 +220,19 @@ impl PlayerApp {
         }
     }
 
-    fn open_stream(&mut self, connection: Connection) {
+    /// In `Single` the wall shows one stream at a time, so opening replaces
+    /// what is there; in `Multi` it adds a tile.
+    fn open_stream(&mut self, connection: Connection, window: &mut Window) {
+        if self.library.layout == LayoutMode::Single {
+            self.close_all(window);
+        } else if self.open.iter().any(|s| s.id == connection.id) {
+            return;
+        }
+        self.push_stream(connection);
+        self.save_library();
+    }
+
+    fn push_stream(&mut self, connection: Connection) {
         if self.open.iter().any(|s| s.id == connection.id) {
             return;
         }
@@ -222,7 +241,61 @@ impl PlayerApp {
             player: Player::start(connection),
             texture: None,
         });
+    }
+
+    /// Opens every connection in a group as a set, switching to the grid so
+    /// they are all visible.
+    fn open_group(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let connections = self.library.connections_under(id);
+        if connections.is_empty() {
+            return;
+        }
+        self.close_all(window);
+        if connections.len() > 1 {
+            self.library.layout = LayoutMode::Multi;
+        }
+        for connection in connections {
+            self.push_stream(connection);
+        }
         self.save_library();
+        cx.notify();
+    }
+
+    fn close_all(&mut self, window: &mut Window) {
+        for closed in self.open.drain(..) {
+            if let Some(texture) = closed.texture {
+                let _ = window.drop_image(texture);
+            }
+        }
+    }
+
+    fn toggle_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.library.layout = self.library.layout.toggled();
+        // Collapsing to one view keeps the stream that was opened last.
+        if self.library.layout == LayoutMode::Single && self.open.len() > 1 {
+            let keep = self.open.pop();
+            self.close_all(window);
+            self.open.extend(keep);
+        }
+        self.save_library();
+        cx.notify();
+    }
+
+    /// Moves an open tile in front of another, so the grid can be arranged.
+    fn reorder_tile(&mut self, dragged: Uuid, target: Uuid, cx: &mut Context<Self>) {
+        if dragged == target {
+            return;
+        }
+        let Some(from) = self.open.iter().position(|s| s.id == dragged) else {
+            return;
+        };
+        let Some(to) = self.open.iter().position(|s| s.id == target) else {
+            return;
+        };
+        let moved = self.open.remove(from);
+        self.open.insert(to, moved);
+        self.save_library();
+        cx.notify();
     }
 
     fn close_stream(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
@@ -433,7 +506,14 @@ fn row_menu(
     this: &Entity<PlayerApp>,
 ) -> PopupMenu {
     let menu = if is_group {
-        menu.item(PopupMenuItem::new("New stream\u{2026}").on_click({
+        menu.item(PopupMenuItem::new("Open all").on_click({
+            let this = this.clone();
+            move |_, window, app| {
+                this.update(app, |this, cx| this.open_group(id, window, cx));
+            }
+        }))
+        .item(PopupMenuItem::separator())
+        .item(PopupMenuItem::new("New stream\u{2026}").on_click({
             let this = this.clone();
             move |_, window, app| {
                 this.update(app, |this, cx| {
@@ -461,10 +541,10 @@ fn row_menu(
     } else {
         menu.item(PopupMenuItem::new("Open").on_click({
             let this = this.clone();
-            move |_, _, app| {
+            move |_, window, app| {
                 this.update(app, |this, cx| {
                     if let Some(connection) = this.library.connection(id).cloned() {
-                        this.open_stream(connection);
+                        this.open_stream(connection, window);
                         cx.notify();
                     }
                 });
@@ -586,6 +666,19 @@ impl PlayerApp {
                             .outline()
                             .small()
                             .on_click(cx.listener(|this, _, _, cx| this.add_group(cx))),
+                    )
+                    .child(
+                        Button::new("layout")
+                            .label(self.library.layout.label())
+                            .ghost()
+                            .small()
+                            .tooltip(match self.library.layout {
+                                LayoutMode::Single => "One at a time \u{2014} opening replaces",
+                                LayoutMode::Multi => "Many \u{2014} opening adds a tile",
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_layout(window, cx)
+                            })),
                     ),
             )
             .child(
@@ -696,9 +789,11 @@ impl PlayerApp {
                                             }
                                         }),
                                 )
-                                .on_click(move |_, _window, app| {
+                                .on_click(move |_, window, app| {
                                     if let Some(id) = id {
-                                        this.update(app, |this, cx| this.on_item_click(id, cx));
+                                        this.update(app, |this, cx| {
+                                            this.on_item_click(id, window, cx)
+                                        });
                                     }
                                 })
                         }
@@ -806,12 +901,30 @@ impl PlayerApp {
             .bg(gpui::black())
             .child(
                 h_flex()
+                    .id(("tile-header", id.as_u128() as usize))
                     .flex_none()
                     .px_2()
                     .py_1()
                     .gap_2()
                     .justify_between()
                     .bg(cx.theme().secondary)
+                    .on_drag(
+                        DraggedTile {
+                            id,
+                            label: name.clone().into(),
+                        },
+                        |dragged, _, _, cx| {
+                            let label = dragged.label.clone();
+                            cx.new(|_| DragPreview { label })
+                        },
+                    )
+                    .drag_over::<DraggedTile>(|mut style, _, _, cx| {
+                        style.background = Some(cx.theme().drop_target.into());
+                        style
+                    })
+                    .on_drop::<DraggedTile>(cx.listener(move |this, dragged: &DraggedTile, _, cx| {
+                        this.reorder_tile(dragged.id, id, cx);
+                    }))
                     .child(
                         h_flex()
                             .gap_2()

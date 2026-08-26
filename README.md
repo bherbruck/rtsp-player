@@ -115,13 +115,19 @@ you use anywhere else.
 ## Using it
 
 - **Click a connection** — opens it on the wall. Click a group to fold it.
-- **Right-click a row** — Open, Edit and Delete on a connection; New stream,
-  New group, Rename and Delete on a group.
+- **One / Many** — in *One* (the default) opening a connection replaces what
+  is playing; in *Many* it adds another tile. Switching back to One keeps the
+  stream you opened last.
+- **Right-click a row** — Open, Edit and Delete on a connection; Open all,
+  New stream, New group, Rename and Delete on a group.
+- **Open all** — plays every connection in a group at once, so a group doubles
+  as a saved set of streams. It switches to Many for you.
 - **Drag rows** — drop onto a group to move inside it, or onto a connection to
   move alongside it. A collapsed group opens when you hover it mid-drag, and a
   group cannot be dropped into itself.
 - **Add stream / Group** — same thing from the toolbar, adding inside whatever
   is selected.
+- **Drag a tile by its header** — drop it on another tile to reorder the grid.
 - **✕ on a tile** — closes that stream.
 - **Theme button** — cycles Auto (follows the desktop), Light and Dark. Auto
   keeps following the system if it changes while the app is open.
