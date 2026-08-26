@@ -1,3 +1,11 @@
+// Without this a Windows release build is a console app, so launching the GUI
+// pops an empty terminal behind the window. `--probe` output is still captured
+// when redirected to a file or pipe.
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 mod model;
 mod stream;
 mod ui;
