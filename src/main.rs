@@ -37,6 +37,8 @@ const ICONS: &[(&str, &[u8])] = &[
     icon!("icons/panel-left.svg"),
     icon!("icons/maximize.svg"),
     icon!("icons/minimize.svg"),
+    icon!("icons/refresh.svg"),
+    icon!("icons/settings.svg"),
 ];
 
 impl AssetSource for Assets {

@@ -119,7 +119,8 @@ Everything lives in one hand-editable YAML file:
 overrides it if you would rather keep the file somewhere else. An older
 `library.json` is migrated automatically and kept as `library.json.bak`.
 
-Edit it while the app is closed — it is rewritten whenever anything changes.
+Edit it whenever you like and press the reload icon above the wall; otherwise
+edit it while the app is closed, since it is rewritten when things change.
 
 ```yaml
 roots:
@@ -180,8 +181,14 @@ you use anywhere else.
 - **✕ on a tile** — closes that stream.
 - **Theme button** — cycles Auto (follows the desktop), Light and Dark. Auto
   keeps following the system if it changes while the app is open.
-- **Sidebar and fullscreen** — the two icons above the wall collapse the
-  sidebar and toggle fullscreen, for using the whole screen as a monitor.
+- **Sidebar and fullscreen** — the icons above the wall collapse the sidebar
+  and toggle fullscreen, for using the whole screen as a monitor.
+- **Config icons** — reload the config file from disk, open it in your editor,
+  or reveal its folder, without leaving the app.
+
+Every picture is scaled to fill whichever axis runs out first and centred in
+its tile: never stretched, never cropped, and scaled up when the camera is
+smaller than the tile.
 
 ### Saved views
 

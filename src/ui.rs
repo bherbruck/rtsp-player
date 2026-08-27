@@ -6,9 +6,9 @@ use crate::model::{
 use crate::stream::{Player, Status};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ObjectFit,
-    ParentElement as _, RenderImage, SharedString, StatefulInteractiveElement as _, Styled as _,
-    StyledImage as _, Task, Window, div, img, px, relative, svg,
+    AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
+    RenderImage, SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, canvas,
+    div, px, relative, svg,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
@@ -156,6 +156,41 @@ impl PlayerApp {
             this.push_stream(connection);
         }
         this
+    }
+
+    /// Re-reads the config file, so it can be hand-edited while the app runs.
+    fn reload_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.draft = None;
+        self.form = None;
+        self.error = None;
+        self.close_all(window);
+
+        self.library = Library::load();
+        let restore: Vec<Connection> = self
+            .library
+            .open
+            .iter()
+            .filter_map(|id| self.library.connection(*id).cloned())
+            .collect();
+        for connection in restore {
+            self.push_stream(connection);
+        }
+        apply_theme(self.library.theme, window, cx);
+        self.rebuild_tree(cx);
+    }
+
+    fn open_config_file(&mut self, cx: &mut Context<Self>) {
+        match Library::path() {
+            Ok(path) => cx.open_with_system(&path),
+            Err(e) => self.error = Some(format!("No config path: {e}").into()),
+        }
+    }
+
+    fn reveal_config_folder(&mut self, cx: &mut Context<Self>) {
+        match Library::path() {
+            Ok(path) => cx.reveal_path(&path),
+            Err(e) => self.error = Some(format!("No config path: {e}").into()),
+        }
     }
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -1232,6 +1267,27 @@ impl PlayerApp {
             ))
             .child(div().flex_1())
             .child(icon_button(
+                "reload-config",
+                "icons/refresh.svg",
+                "Reload the config file",
+                cx,
+                |this, window, cx| this.reload_config(window, cx),
+            ))
+            .child(icon_button(
+                "open-config",
+                "icons/settings.svg",
+                "Open the config file",
+                cx,
+                |this, _, cx| this.open_config_file(cx),
+            ))
+            .child(icon_button(
+                "reveal-config",
+                "icons/folder.svg",
+                "Show the config folder",
+                cx,
+                |this, _, cx| this.reveal_config_folder(cx),
+            ))
+            .child(icon_button(
                 "toggle-fullscreen",
                 "icons/maximize.svg",
                 "Fullscreen",
@@ -1592,17 +1648,39 @@ impl PlayerApp {
             .bg(gpui::black())
             // The picture owns the whole tile; the header floats over it.
             .child(match stream.texture.clone() {
-                Some(texture) => div()
-                    .size_full()
-                    .overflow_hidden()
-                    .child(
-                        img(texture)
-                            .size_full()
-                            // Contain: scaled as large as fits, never
-                            // distorted and never cropped.
-                            .object_fit(ObjectFit::Contain),
-                    )
-                    .into_any_element(),
+                // gpui's Img forces its own aspect ratio onto the layout, so
+                // no combination of width/height makes it fit both axes. Paint
+                // the frame directly instead: scaled to fill whichever axis
+                // runs out first, centred, never cropped and never distorted.
+                Some(texture) => canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        let frame = texture.size(0);
+                        let (fw, fh) = (u32::from(frame.width) as f32, u32::from(frame.height) as f32);
+                        let (bw, bh) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                        if fw <= 0.0 || fh <= 0.0 || bw <= 0.0 || bh <= 0.0 {
+                            return;
+                        }
+                        let scale = (bw / fw).min(bh / fh);
+                        let (w, h) = (fw * scale, fh * scale);
+                        let placed = gpui::Bounds {
+                            origin: gpui::point(
+                                bounds.origin.x + px((bw - w) / 2.0),
+                                bounds.origin.y + px((bh - h) / 2.0),
+                            ),
+                            size: gpui::size(px(w), px(h)),
+                        };
+                        let _ = window.paint_image(
+                            placed,
+                            gpui::Corners::default(),
+                            texture.clone(),
+                            0,
+                            false,
+                        );
+                    },
+                )
+                .size_full()
+                .into_any_element(),
                 None => v_flex()
                     .size_full()
                     .items_center()
