@@ -579,3 +579,92 @@ impl Library {
             .unwrap_or(false)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group(name: &str, expanded: bool, children: Vec<Node>) -> Node {
+        Node::Group {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            children,
+            expanded,
+        }
+    }
+
+    fn library() -> Library {
+        Library {
+            roots: vec![
+                group("open", true, vec![Node::Stream(Connection::new("a", "rtsp://a"))]),
+                group("shut", false, vec![Node::Stream(Connection::new("b", "rtsp://b"))]),
+                Node::Stream(Connection::new("loose", "rtsp://c")),
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn expansion(library: &Library) -> Vec<(String, bool)> {
+        fn walk(nodes: &[Node], out: &mut Vec<(String, bool)>) {
+            for node in nodes {
+                if let Node::Group {
+                    name,
+                    expanded,
+                    children,
+                    ..
+                } = node
+                {
+                    out.push((name.clone(), *expanded));
+                    walk(children, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&library.roots, &mut out);
+        out
+    }
+
+    /// Dragging a node about must not open or close anything.
+    #[test]
+    fn moving_a_node_leaves_expansion_alone() {
+        let mut library = library();
+        let before = expansion(&library);
+
+        let loose = library.roots[2].id();
+        let shut = library.roots[1].id();
+        assert!(library.move_node(loose, Some(shut)));
+
+        assert_eq!(expansion(&library), before);
+        assert_eq!(library.parent_of(loose), Some(shut));
+    }
+
+    #[test]
+    fn a_group_cannot_be_dropped_inside_itself() {
+        let mut library = library();
+        let outer = library.roots[0].id();
+        let inner = match &library.roots[0] {
+            Node::Group { children, .. } => children[0].id(),
+            _ => unreachable!(),
+        };
+        assert!(!library.move_node(outer, Some(inner)));
+        assert!(!library.move_node(outer, Some(outer)));
+    }
+
+    /// A span that covers its neighbours wins; the covered cells are dropped.
+    #[test]
+    fn overlapping_cells_are_resolved_on_clamp() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut view = GridView::new("wall", 3, 3);
+        view.cells.push(GridCell {
+            row: 0,
+            col: 0,
+            row_span: 2,
+            col_span: 2,
+            connection: a,
+        });
+        view.cells.push(GridCell::new(1, 1, b));
+        view.clamp();
+        assert_eq!(view.cells.len(), 1);
+        assert_eq!(view.cells[0].connection, a);
+    }
+}

@@ -46,6 +46,8 @@ jobs:
         with:
           key: ${{ matrix.asset }}
 
+      - run: cargo test --release
+
       - run: cargo build --release
 
       - name: Stage the binary

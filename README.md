@@ -170,8 +170,8 @@ you use anywhere else.
 - **Open all** — plays every connection in a group at once, so a group doubles
   as a saved set of streams. It switches to Many for you.
 - **Drag rows** — drop onto a group to move inside it, or onto a connection to
-  move alongside it. A collapsed group opens when you hover it mid-drag, and a
-  group cannot be dropped into itself.
+  move alongside it. A group cannot be dropped into itself, and dragging never
+  opens or closes anything: the tree stays exactly as you left it.
 - **Add stream / Group** — same thing from the toolbar, adding inside whatever
   is selected.
 - **Hover a tile** — its header fades in over the picture with the name, frame

@@ -266,19 +266,6 @@ impl PlayerApp {
         }
     }
 
-    /// Hovering a collapsed group mid-drag opens it, so you can drop deeper
-    /// without letting go first.
-    fn expand_for_drag(&mut self, id: Uuid, cx: &mut Context<Self>) {
-        let collapsed = matches!(
-            self.library.find(id),
-            Some(Node::Group { expanded: false, .. })
-        );
-        if collapsed {
-            self.library.set_expanded(id, true);
-            self.rebuild_tree(cx);
-        }
-    }
-
     /// In `Single` the wall shows one stream at a time, so opening replaces
     /// what is there; in `Multi` it adds a tile.
     fn open_stream(&mut self, connection: Connection, window: &mut Window) {
@@ -1022,7 +1009,6 @@ impl PlayerApp {
                                 .unwrap_or(("s", entry.item().id.as_ref()));
                             let is_group = kind == "g";
                             let id = raw_id.parse::<Uuid>().ok();
-                            let collapsed = is_group && !entry.is_expanded();
                             let chevron = if entry.is_expanded() {
                                 "icons/chevron-down.svg"
                             } else {
@@ -1088,16 +1074,6 @@ impl PlayerApp {
                                                         this.drop_onto(dragged, node_id, cx)
                                                     });
                                                 }
-                                            })
-                                            .when(collapsed, |row| {
-                                                let this = this.clone();
-                                                row.on_drag_move::<DraggedNode>(
-                                                    move |_, _, app| {
-                                                        this.update(app, |this, cx| {
-                                                            this.expand_for_drag(node_id, cx)
-                                                        });
-                                                    },
-                                                )
                                             })
                                         })
                                         .context_menu({
