@@ -1,6 +1,8 @@
 //! The window: a connection tree on the left, a video wall on the right.
 
-use crate::model::{Connection, LayoutMode, Library, Node, ThemePref, Transport};
+use crate::model::{
+    Connection, GridView, LayoutMode, Library, Node, ThemePref, Transport,
+};
 use crate::stream::{Player, Status};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -223,6 +225,8 @@ impl PlayerApp {
     /// In `Single` the wall shows one stream at a time, so opening replaces
     /// what is there; in `Multi` it adds a tile.
     fn open_stream(&mut self, connection: Connection, window: &mut Window) {
+        // A saved view pins specific positions; opening freely leaves it.
+        self.library.active_view = None;
         if self.library.layout == LayoutMode::Single {
             self.close_all(window);
         } else if self.open.iter().any(|s| s.id == connection.id) {
@@ -250,6 +254,7 @@ impl PlayerApp {
         if connections.is_empty() {
             return;
         }
+        self.library.active_view = None;
         self.close_all(window);
         if connections.len() > 1 {
             self.library.layout = LayoutMode::Multi;
@@ -281,6 +286,118 @@ impl PlayerApp {
         cx.notify();
     }
 
+    /// Loads a saved wall: opens exactly its connections and shows them at the
+    /// positions the view records.
+    fn load_view(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.library.view(id) else {
+            return;
+        };
+        let wanted: Vec<Uuid> = view.cells.iter().map(|c| c.connection).collect();
+        let connections: Vec<Connection> = wanted
+            .iter()
+            .filter_map(|c| self.library.connection(*c).cloned())
+            .collect();
+
+        self.close_all(window);
+        for connection in connections {
+            self.push_stream(connection);
+        }
+        self.library.active_view = Some(id);
+        self.save_library();
+        cx.notify();
+    }
+
+    fn close_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.library.active_view = None;
+        self.close_all(window);
+        self.save_library();
+        cx.notify();
+    }
+
+    /// Snapshots what is on the wall into a new saved view, filling the grid
+    /// left to right.
+    fn save_wall_as_view(&mut self, cx: &mut Context<Self>) {
+        if self.open.is_empty() {
+            self.error = Some("Open some streams first.".into());
+            cx.notify();
+            return;
+        }
+        let cols = grid_columns(self.open.len());
+        let rows = self.open.len().div_ceil(cols);
+        let mut view = GridView::new(format!("View {}", self.library.views.len() + 1), rows, cols);
+        for (ix, stream) in self.open.iter().enumerate() {
+            view.place(stream.id, ix / cols, ix % cols);
+        }
+        let id = view.id;
+        self.library.views.push(view);
+        self.library.active_view = Some(id);
+        self.error = None;
+        self.save_library();
+        cx.notify();
+    }
+
+    fn resize_view(&mut self, rows: isize, cols: isize, cx: &mut Context<Self>) {
+        let Some(id) = self.library.active_view else {
+            return;
+        };
+        if let Some(view) = self.library.view_mut(id) {
+            view.rows = view.rows.saturating_add_signed(rows).max(1);
+            view.cols = view.cols.saturating_add_signed(cols).max(1);
+            view.clamp();
+        }
+        self.save_library();
+        cx.notify();
+    }
+
+    /// Puts a connection at a grid position, starting its stream if needed.
+    fn place_in_view(
+        &mut self,
+        connection: Uuid,
+        row: usize,
+        col: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.library.active_view else {
+            return;
+        };
+        let Some(view) = self.library.view_mut(id) else {
+            return;
+        };
+        // Whatever sat here is evicted; close its stream so the wall matches.
+        let evicted: Vec<Uuid> = view
+            .cells
+            .iter()
+            .filter(|c| c.covers(row, col) && c.connection != connection)
+            .map(|c| c.connection)
+            .collect();
+        view.place(connection, row, col);
+
+        for id in evicted {
+            if let Some(ix) = self.open.iter().position(|s| s.id == id) {
+                let closed = self.open.remove(ix);
+                if let Some(texture) = closed.texture {
+                    let _ = window.drop_image(texture);
+                }
+            }
+        }
+        if let Some(connection) = self.library.connection(connection).cloned() {
+            self.push_stream(connection);
+        }
+        self.save_library();
+        cx.notify();
+    }
+
+    fn delete_view(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.library.views.retain(|v| v.id != id);
+        if self.library.active_view == Some(id) {
+            self.library.active_view = None;
+            self.close_all(window);
+        }
+        self.save_library();
+        cx.notify();
+    }
+
     /// Moves an open tile in front of another, so the grid can be arranged.
     fn reorder_tile(&mut self, dragged: Uuid, target: Uuid, cx: &mut Context<Self>) {
         if dragged == target {
@@ -303,6 +420,9 @@ impl PlayerApp {
             let closed = self.open.remove(ix);
             if let Some(texture) = closed.texture {
                 let _ = window.drop_image(texture);
+            }
+            if let Some(view) = self.library.active_view.and_then(|v| self.library.view_mut(v)) {
+                view.remove(id);
             }
             self.save_library();
         }
@@ -606,11 +726,11 @@ fn tree_items(nodes: &[Node]) -> Vec<TreeItem> {
                 name,
                 children,
                 expanded,
-            } => TreeItem::new(id.to_string(), name.clone())
+            } => TreeItem::new(format!("g:{id}"), name.clone())
                 .children(tree_items(children))
                 .expanded(*expanded),
             Node::Stream(connection) => {
-                TreeItem::new(connection.id.to_string(), connection.name.clone())
+                TreeItem::new(format!("s:{}", connection.id), connection.name.clone())
             }
         })
         .collect()
@@ -701,8 +821,16 @@ impl PlayerApp {
                         let this = cx.entity();
                         let muted = cx.theme().muted_foreground;
                         move |ix, entry, _selected, _window, _cx| {
-                            let id = entry.item().id.parse::<Uuid>().ok();
-                            let is_group = entry.is_folder();
+                            // `entry.is_folder()` only means "has children", so
+                            // an empty group would render and behave as a
+                            // stream. The kind is encoded in the id instead.
+                            let (kind, raw_id) = entry
+                                .item()
+                                .id
+                                .split_once(':')
+                                .unwrap_or(("s", entry.item().id.as_ref()));
+                            let is_group = kind == "g";
+                            let id = raw_id.parse::<Uuid>().ok();
                             let collapsed = is_group && !entry.is_expanded();
                             let chevron = if entry.is_expanded() {
                                 "icons/chevron-down.svg"
@@ -808,6 +936,7 @@ impl PlayerApp {
                         .child("No connections yet. Add one to get started."),
                 )
             })
+            .child(self.render_views(cx))
             .child(
                 v_flex()
                     .p_2()
@@ -834,7 +963,107 @@ impl PlayerApp {
             )
     }
 
+    /// Saved walls, listed under the tree.
+    fn render_views(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = self.library.active_view;
+
+        v_flex()
+            .flex_none()
+            .max_h(px(180.0))
+            .border_t_1()
+            .border_color(cx.theme().sidebar_border)
+            .child(
+                h_flex()
+                    .px_2()
+                    .py_1()
+                    .gap_2()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Views"),
+                    )
+                    .child(
+                        Button::new("save-view")
+                            .label("Save wall")
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(|this, _, _, cx| this.save_wall_as_view(cx))),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .id("views-list")
+                    .px_1()
+                    .pb_1()
+                    .gap_px()
+                    .overflow_y_scroll()
+                    .children(self.library.views.iter().map(|view| {
+                        let id = view.id;
+                        let selected = active == Some(id);
+                        h_flex()
+                            .id(("view", id.as_u128() as usize))
+                            .px_2()
+                            .py_1()
+                            .gap_2()
+                            .rounded(px(4.0))
+                            .justify_between()
+                            .when(selected, |el| el.bg(cx.theme().list_active))
+                            .hover(|el| el.bg(cx.theme().list_hover))
+                            .child(div().text_sm().truncate().child(view.name.clone()))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("{}\u{00d7}{}", view.rows, view.cols)),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.load_view(id, window, cx)
+                            }))
+                            .context_menu({
+                                let this = cx.entity();
+                                move |menu, _, _| {
+                                    menu.item(PopupMenuItem::new("Delete view").on_click({
+                                        let this = this.clone();
+                                        move |_, window, app| {
+                                            this.update(app, |this, cx| {
+                                                this.delete_view(id, window, cx)
+                                            });
+                                        }
+                                    }))
+                                }
+                            })
+                    })),
+            )
+            .when(self.library.views.is_empty(), |el| {
+                el.child(
+                    div()
+                        .px_2()
+                        .pb_2()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Open some streams, then Save wall."),
+                )
+            })
+    }
+
     fn render_wall(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(view) = self
+            .library
+            .active_view
+            .and_then(|id| self.library.view(id))
+        {
+            return v_flex()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .child(self.render_view_bar(view, cx))
+                .child(self.render_view_grid(view, cx))
+                .into_any_element();
+        }
+
         let columns = grid_columns(self.open.len().max(1));
 
         let mut rows = Vec::new();
@@ -874,6 +1103,182 @@ impl PlayerApp {
                 )
             })
             .children(rows)
+            .into_any_element()
+    }
+
+    /// Controls for the active view: its size, and a way back to the free wall.
+    fn render_view_bar(&self, view: &GridView, cx: &mut Context<Self>) -> impl IntoElement {
+        let stepper = |id: &'static str,
+                       label: &'static str,
+                       rows: isize,
+                       cols: isize,
+                       cx: &mut Context<Self>| {
+            Button::new(id)
+                .label(label)
+                .ghost()
+                .xsmall()
+                .on_click(cx.listener(move |this, _, _, cx| this.resize_view(rows, cols, cx)))
+        };
+
+        h_flex()
+            .flex_none()
+            .px_2()
+            .py_1()
+            .gap_2()
+            .items_center()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(div().text_sm().child(view.name.clone()))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("rows"),
+                    )
+                    .child(stepper("rows-minus", "\u{2212}", -1, 0, cx))
+                    .child(div().text_xs().child(view.rows.to_string()))
+                    .child(stepper("rows-plus", "+", 1, 0, cx)),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("cols"),
+                    )
+                    .child(stepper("cols-minus", "\u{2212}", 0, -1, cx))
+                    .child(div().text_xs().child(view.cols.to_string()))
+                    .child(stepper("cols-plus", "+", 0, 1, cx)),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("close-view")
+                    .label("Close view")
+                    .ghost()
+                    .xsmall()
+                    .on_click(cx.listener(|this, _, window, cx| this.close_view(window, cx))),
+            )
+    }
+
+    /// Cells are positioned as fractions of the wall, so a cell can span rows
+    /// and columns without fighting flex layout.
+    fn render_view_grid(&self, view: &GridView, cx: &mut Context<Self>) -> impl IntoElement {
+        let (rows, cols) = (view.rows.max(1), view.cols.max(1));
+        let mut children: Vec<gpui::AnyElement> = Vec::new();
+
+        for cell in &view.cells {
+            let frame = (
+                cell.col as f32 / cols as f32,
+                cell.row as f32 / rows as f32,
+                cell.col_span.max(1) as f32 / cols as f32,
+                cell.row_span.max(1) as f32 / rows as f32,
+            );
+            let body = match self.open.iter().find(|s| s.id == cell.connection) {
+                Some(stream) => self.render_tile(stream, cx).into_any_element(),
+                None => self.render_missing_cell(cell.connection, cx),
+            };
+            children.push(
+                self.cell_frame(frame, cell.row, cell.col, cx)
+                    .child(body)
+                    .into_any_element(),
+            );
+        }
+
+        for row in 0..rows {
+            for col in 0..cols {
+                if view.cell_at(row, col).is_some() {
+                    continue;
+                }
+                let frame = (
+                    col as f32 / cols as f32,
+                    row as f32 / rows as f32,
+                    1.0 / cols as f32,
+                    1.0 / rows as f32,
+                );
+                children.push(
+                    self.cell_frame(frame, row, col, cx)
+                        .child(
+                            div()
+                                .size_full()
+                                .rounded(px(6.0))
+                                .border_1()
+                                .border_dashed()
+                                .border_color(cx.theme().border)
+                                .into_any_element(),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .p_1()
+            .children(children)
+    }
+
+    /// A positioned slot that accepts both tiles and tree rows.
+    fn cell_frame(
+        &self,
+        frame: (f32, f32, f32, f32),
+        row: usize,
+        col: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let (x, y, w, h) = frame;
+        div()
+            .id(("cell", row * 1024 + col))
+            .absolute()
+            .left(relative(x))
+            .top(relative(y))
+            .w(relative(w))
+            .h(relative(h))
+            .p_1()
+            .flex()
+            .drag_over::<DraggedTile>(|mut style, _, _, cx| {
+                style.background = Some(cx.theme().drop_target.into());
+                style
+            })
+            .drag_over::<DraggedNode>(|mut style, _, _, cx| {
+                style.background = Some(cx.theme().drop_target.into());
+                style
+            })
+            .on_drop::<DraggedTile>(cx.listener(move |this, dragged: &DraggedTile, window, cx| {
+                this.place_in_view(dragged.id, row, col, window, cx);
+            }))
+            .on_drop::<DraggedNode>(cx.listener(move |this, dragged: &DraggedNode, window, cx| {
+                let id = dragged.id;
+                if this.library.connection(id).is_some() {
+                    this.place_in_view(id, row, col, window, cx);
+                }
+            }))
+    }
+
+    /// A cell whose connection has been deleted from the library.
+    fn render_missing_cell(&self, id: Uuid, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let _ = id;
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(cx.theme().border)
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child("connection missing")
+            .into_any_element()
     }
 
     fn render_tile(&self, stream: &OpenStream, cx: &mut Context<Self>) -> impl IntoElement {

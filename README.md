@@ -103,10 +103,56 @@ target that has never been tested.
 cargo run --release
 ```
 
-Connections are stored as JSON in the platform config directory —
-`~/.config/rtsp-player/library.json` on Linux, `%APPDATA%` on Windows,
-`~/Library/Application Support` on macOS. Streams that were playing at exit
-reopen on the next launch.
+Streams that were playing at exit reopen on the next launch.
+
+## Configuration
+
+Everything lives in one hand-editable YAML file:
+
+| Platform | Path |
+| --- | --- |
+| Linux | `~/.config/rtsp-player/library.yaml` |
+| Windows | `%APPDATA%\rtsp-player\rtsp-player\config\library.yaml` |
+| macOS | `~/Library/Application Support/dev.rtsp-player.rtsp-player/library.yaml` |
+
+`rtsp-player --config` prints the resolved path, and `RTSP_PLAYER_CONFIG`
+overrides it if you would rather keep the file somewhere else. An older
+`library.json` is migrated automatically and kept as `library.json.bak`.
+
+Edit it while the app is closed — it is rewritten whenever anything changes.
+
+```yaml
+roots:
+  - kind: group
+    id: 3072457c-8f14-47cb-b1a8-6b7fe492068a
+    name: Cameras
+    expanded: true
+    children:
+      - kind: stream
+        id: 760a78ca-020c-459e-beba-4223546bd141
+        name: Front door
+        url: rtsp://192.168.1.50:554/stream1
+        username: admin      # both optional
+        password: hunter2
+        transport: tcp       # tcp or udp
+theme: dark                  # system, light or dark
+layout: single               # single or multi
+views:
+  - id: 6538f853-70c9-406d-9f71-d99228d727ea
+    name: Front wall
+    rows: 3
+    cols: 3
+    cells:
+      - row: 0
+        col: 0
+        row_span: 2          # optional, defaults to 1
+        col_span: 2
+        connection: 760a78ca-020c-459e-beba-4223546bd141
+```
+
+A cell whose span would cover another cell wins; the covered ones are dropped
+when the file loads, so an overlapping hand-edit cannot render tiles on top of
+each other.
 
 **Passwords are stored in plain text** in that file. It is not readable by
 other users, but it is not encrypted either. Do not put a password there that
@@ -127,10 +173,26 @@ you use anywhere else.
   group cannot be dropped into itself.
 - **Add stream / Group** — same thing from the toolbar, adding inside whatever
   is selected.
-- **Drag a tile by its header** — drop it on another tile to reorder the grid.
+- **Drag a tile by its header** — drop it on another tile to reorder the grid,
+  or onto a cell of a saved view to move it there.
 - **✕ on a tile** — closes that stream.
 - **Theme button** — cycles Auto (follows the desktop), Light and Dark. Auto
   keeps following the system if it changes while the app is open.
+
+### Saved views
+
+A view is a fixed grid with cameras at chosen positions, listed under the tree.
+
+- **Save wall** — snapshots whatever is playing into a new view.
+- **Click a view** — loads it, playing exactly its cameras at their positions.
+- **rows / cols** — resize the grid; placements outside the new size are
+  dropped.
+- **Drag onto a cell** — a tree row or another tile drops into that position,
+  evicting whatever was there.
+- **Right-click a view** — Delete.
+
+Cells can span rows and columns, which the grid honours but has no button for
+yet; set `row_span` / `col_span` in the config file.
 
 TCP is the default transport and the right choice almost always. UDP is
 lower latency on a quiet LAN but `retina` has no reorder buffer, so any

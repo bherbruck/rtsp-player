@@ -153,6 +153,112 @@ impl LayoutMode {
     }
 }
 
+fn one() -> usize {
+    1
+}
+
+/// One connection placed on a saved grid. Spans let a camera take more than a
+/// single cell, so a wall can have a large primary view beside small ones.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GridCell {
+    pub row: usize,
+    pub col: usize,
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub row_span: usize,
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub col_span: usize,
+    pub connection: Uuid,
+}
+
+fn is_one(n: &usize) -> bool {
+    *n == 1
+}
+
+impl GridCell {
+    pub fn new(row: usize, col: usize, connection: Uuid) -> Self {
+        Self {
+            row,
+            col,
+            row_span: 1,
+            col_span: 1,
+            connection,
+        }
+    }
+
+    pub fn covers(&self, row: usize, col: usize) -> bool {
+        row >= self.row
+            && row < self.row + self.row_span.max(1)
+            && col >= self.col
+            && col < self.col + self.col_span.max(1)
+    }
+}
+
+/// A saved wall: a fixed grid with connections at chosen positions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GridView {
+    pub id: Uuid,
+    pub name: String,
+    pub rows: usize,
+    pub cols: usize,
+    #[serde(default)]
+    pub cells: Vec<GridCell>,
+}
+
+impl GridView {
+    pub fn new(name: impl Into<String>, rows: usize, cols: usize) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            rows: rows.max(1),
+            cols: cols.max(1),
+            cells: Vec::new(),
+        }
+    }
+
+    pub fn cell_at(&self, row: usize, col: usize) -> Option<&GridCell> {
+        self.cells.iter().find(|c| c.covers(row, col))
+    }
+
+    /// Puts `connection` at a position, evicting whatever occupied it.
+    pub fn place(&mut self, connection: Uuid, row: usize, col: usize) {
+        self.cells
+            .retain(|c| c.connection != connection && !c.covers(row, col));
+        self.cells.push(GridCell::new(row, col, connection));
+    }
+
+    pub fn remove(&mut self, connection: Uuid) {
+        self.cells.retain(|c| c.connection != connection);
+    }
+
+    /// Drops placements that fell outside the grid after a resize, and any that
+    /// a earlier cell's span already covers. Hand-edited files can overlap;
+    /// without this they would be drawn on top of each other.
+    pub fn clamp(&mut self) {
+        self.rows = self.rows.max(1);
+        self.cols = self.cols.max(1);
+        let (rows, cols) = (self.rows, self.cols);
+        self.cells.retain(|c| c.row < rows && c.col < cols);
+        for cell in &mut self.cells {
+            cell.row_span = cell.row_span.max(1).min(rows - cell.row);
+            cell.col_span = cell.col_span.max(1).min(cols - cell.col);
+        }
+
+        let mut kept: Vec<GridCell> = Vec::with_capacity(self.cells.len());
+        for cell in std::mem::take(&mut self.cells) {
+            let overlaps = kept.iter().any(|k| {
+                (cell.row..cell.row + cell.row_span).any(|r| {
+                    (cell.col..cell.col + cell.col_span).any(|c| k.covers(r, c))
+                })
+            });
+            if !overlaps {
+                kept.push(cell);
+            }
+        }
+        self.cells = kept;
+    }
+
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Library {
     #[serde(default)]
@@ -165,25 +271,80 @@ pub struct Library {
     pub theme: ThemePref,
     #[serde(default)]
     pub layout: LayoutMode,
+    /// Saved walls, each a fixed grid with connections at chosen positions.
+    #[serde(default)]
+    pub views: Vec<GridView>,
+    /// The view currently on the wall, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_view: Option<Uuid>,
 }
 
 impl Library {
+    /// Makes a hand-edited file safe to render.
+    fn sanitize(&mut self) {
+        for view in &mut self.views {
+            view.clamp();
+        }
+        let known: Vec<Uuid> = self.views.iter().map(|v| v.id).collect();
+        if let Some(active) = self.active_view
+            && !known.contains(&active)
+        {
+            self.active_view = None;
+        }
+    }
+
+    pub fn view(&self, id: Uuid) -> Option<&GridView> {
+        self.views.iter().find(|v| v.id == id)
+    }
+
+    pub fn view_mut(&mut self, id: Uuid) -> Option<&mut GridView> {
+        self.views.iter_mut().find(|v| v.id == id)
+    }
+}
+
+impl Library {
+    /// The config file. `RTSP_PLAYER_CONFIG` overrides it, which is handy for
+    /// keeping several libraries or pointing at one in a repo.
     pub fn path() -> Result<PathBuf> {
+        if let Some(override_path) = std::env::var_os("RTSP_PLAYER_CONFIG") {
+            return Ok(PathBuf::from(override_path));
+        }
         let dirs = directories::ProjectDirs::from("dev", "rtsp-player", "rtsp-player")
             .context("no home directory")?;
-        Ok(dirs.config_dir().join("library.json"))
+        Ok(dirs.config_dir().join("library.yaml"))
+    }
+
+    /// Where a pre-YAML config would have been written.
+    fn legacy_json_path() -> Result<PathBuf> {
+        Ok(Self::path()?.with_extension("json"))
     }
 
     pub fn load() -> Self {
         let Ok(path) = Self::path() else {
             return Self::default();
         };
-        let Ok(text) = std::fs::read_to_string(&path) else {
+
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            // A corrupt file should not lose the user their window; start empty
+            // and let the next save overwrite it.
+            let mut library: Self = serde_yaml_ng::from_str(&text).unwrap_or_default();
+            library.sanitize();
+            return library;
+        }
+
+        // First run after the switch to YAML: pick up the old file.
+        let Ok(legacy) = Self::legacy_json_path() else {
             return Self::default();
         };
-        // A corrupt file should not lose the user their window; start empty and
-        // let the next save overwrite it.
-        serde_json::from_str(&text).unwrap_or_default()
+        let Ok(text) = std::fs::read_to_string(&legacy) else {
+            return Self::default();
+        };
+        let library: Self = serde_json::from_str(&text).unwrap_or_default();
+        if library.save().is_ok() {
+            // Keep the original around rather than deleting the user's data.
+            let _ = std::fs::rename(&legacy, legacy.with_extension("json.bak"));
+        }
+        library
     }
 
     pub fn save(&self) -> Result<()> {
@@ -191,9 +352,9 @@ impl Library {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let text = serde_json::to_string_pretty(self)?;
+        let text = serde_yaml_ng::to_string(self)?;
         // Write-then-rename so a crash mid-write cannot truncate the library.
-        let tmp = path.with_extension("json.tmp");
+        let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, text)?;
         std::fs::rename(&tmp, &path)?;
         Ok(())

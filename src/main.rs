@@ -54,9 +54,24 @@ impl AssetSource for Assets {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("--probe") {
-        probe(&args[1..]);
-        return;
+    match args.first().map(String::as_str) {
+        Some("--probe") => {
+            probe(&args[1..]);
+            return;
+        }
+        // The config lives somewhere different on every platform; print it
+        // rather than making people guess.
+        Some("--config") => {
+            match model::Library::path() {
+                Ok(path) => println!("{}", path.display()),
+                Err(e) => {
+                    eprintln!("could not resolve config path: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        _ => {}
     }
 
     // WSLg ships a Wayland compositor older than gpui's client supports, and
