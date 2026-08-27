@@ -66,6 +66,12 @@ pub struct PlayerApp {
     selected: Option<Uuid>,
     open: Vec<OpenStream>,
     form: Option<Form>,
+    /// The tile under the cursor. Its header is the only one drawn.
+    hovered_tile: Option<Uuid>,
+    /// A working copy of the active view. A wall is locked until it is
+    /// unlocked for editing, and edits live here until they are saved, so
+    /// nothing touches the config file until you say so.
+    draft: Option<GridView>,
     error: Option<SharedString>,
     _refresh: Task<()>,
 }
@@ -78,11 +84,19 @@ struct OpenStream {
 
 /// The add/edit sheet. Held here rather than in its own entity so saving is a
 /// plain method call instead of an event round-trip.
+/// What the add/edit sheet is editing. Groups and walls reuse it but show only
+/// the name field.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FormTarget {
+    Connection,
+    Group,
+    View,
+}
+
 struct Form {
     editing: Option<Uuid>,
     parent: Option<Uuid>,
-    /// Groups reuse this sheet but only show the name field.
-    group: bool,
+    target: FormTarget,
     name: Entity<InputState>,
     url: Entity<InputState>,
     username: Entity<InputState>,
@@ -133,6 +147,8 @@ impl PlayerApp {
             selected: None,
             open: Vec::new(),
             form: None,
+            hovered_tile: None,
+            draft: None,
             error: None,
             _refresh: refresh,
         };
@@ -140,6 +156,12 @@ impl PlayerApp {
             this.push_stream(connection);
         }
         this
+    }
+
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.library.sidebar_hidden = !self.library.sidebar_hidden;
+        self.save_library();
+        cx.notify();
     }
 
     fn cycle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -298,6 +320,7 @@ impl PlayerApp {
             .filter_map(|c| self.library.connection(*c).cloned())
             .collect();
 
+        self.draft = None;
         self.close_all(window);
         for connection in connections {
             self.push_stream(connection);
@@ -308,6 +331,7 @@ impl PlayerApp {
     }
 
     fn close_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.draft = None;
         self.library.active_view = None;
         self.close_all(window);
         self.save_library();
@@ -336,16 +360,65 @@ impl PlayerApp {
         cx.notify();
     }
 
-    fn resize_view(&mut self, rows: isize, cols: isize, cx: &mut Context<Self>) {
-        let Some(id) = self.library.active_view else {
+    /// The grid on screen: the draft while editing, otherwise the saved view.
+    fn active_grid(&self) -> Option<&GridView> {
+        self.draft.as_ref().or_else(|| {
+            self.library
+                .active_view
+                .and_then(|id| self.library.view(id))
+        })
+    }
+
+    fn editing(&self) -> bool {
+        self.draft.is_some()
+    }
+
+    /// Unlocks the active wall for editing by taking a working copy.
+    fn begin_edit(&mut self, cx: &mut Context<Self>) {
+        if self.draft.is_some() {
+            return;
+        }
+        if let Some(view) = self
+            .library
+            .active_view
+            .and_then(|id| self.library.view(id))
+            .cloned()
+        {
+            self.draft = Some(view);
+            cx.notify();
+        }
+    }
+
+    /// Writes the working copy back and locks the wall again.
+    fn commit_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.draft.take() else {
             return;
         };
-        if let Some(view) = self.library.view_mut(id) {
-            view.rows = view.rows.saturating_add_signed(rows).max(1);
-            view.cols = view.cols.saturating_add_signed(cols).max(1);
-            view.clamp();
+        if let Some(view) = self.library.view_mut(draft.id) {
+            *view = draft;
         }
         self.save_library();
+        cx.notify();
+    }
+
+    /// Throws the working copy away and replays the saved wall.
+    fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.draft.take().is_none() {
+            return;
+        }
+        if let Some(id) = self.library.active_view {
+            self.load_view(id, window, cx);
+        }
+        cx.notify();
+    }
+
+    fn resize_view(&mut self, rows: isize, cols: isize, cx: &mut Context<Self>) {
+        let Some(view) = self.draft.as_mut() else {
+            return;
+        };
+        view.rows = view.rows.saturating_add_signed(rows).max(1);
+        view.cols = view.cols.saturating_add_signed(cols).max(1);
+        view.clamp();
         cx.notify();
     }
 
@@ -358,10 +431,7 @@ impl PlayerApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(id) = self.library.active_view else {
-            return;
-        };
-        let Some(view) = self.library.view_mut(id) else {
+        let Some(view) = self.draft.as_mut() else {
             return;
         };
         // Whatever sat here is evicted; close its stream so the wall matches.
@@ -384,7 +454,6 @@ impl PlayerApp {
         if let Some(connection) = self.library.connection(connection).cloned() {
             self.push_stream(connection);
         }
-        self.save_library();
         cx.notify();
     }
 
@@ -421,7 +490,7 @@ impl PlayerApp {
             if let Some(texture) = closed.texture {
                 let _ = window.drop_image(texture);
             }
-            if let Some(view) = self.library.active_view.and_then(|v| self.library.view_mut(v)) {
+            if let Some(view) = self.draft.as_mut() {
                 view.remove(id);
             }
             self.save_library();
@@ -482,7 +551,7 @@ impl PlayerApp {
         self.form = Some(Form {
             editing: existing.as_ref().map(|c| c.id),
             parent: self.target_group(),
-            group: false,
+            target: FormTarget::Connection,
             name: name_input,
             url: url_input,
             username: username_input,
@@ -512,7 +581,36 @@ impl PlayerApp {
         self.form = Some(Form {
             editing: Some(id),
             parent: None,
-            group: true,
+            target: FormTarget::Group,
+            name,
+            url: blank(window, cx),
+            username: blank(window, cx),
+            password: blank(window, cx),
+            transport: Transport::default(),
+        });
+        cx.notify();
+    }
+
+    /// Rename sheet for a saved wall.
+    fn open_view_form(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.library.view(id) else {
+            return;
+        };
+        let current = view.name.clone();
+        let name = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Wall name")
+                .default_value(current)
+        });
+        name.update(cx, |state, cx| state.focus(window, cx));
+
+        let blank = |window: &mut Window, cx: &mut Context<Self>| {
+            cx.new(|cx| InputState::new(window, cx))
+        };
+        self.form = Some(Form {
+            editing: Some(id),
+            parent: None,
+            target: FormTarget::View,
             name,
             url: blank(window, cx),
             username: blank(window, cx),
@@ -527,7 +625,7 @@ impl PlayerApp {
 
         let name = form.name.read(cx).value().trim().to_string();
 
-        if form.group {
+        if form.target == FormTarget::Group {
             if let Some(id) = form.editing
                 && !name.is_empty()
             {
@@ -536,6 +634,24 @@ impl PlayerApp {
             }
             self.error = None;
             self.rebuild_tree(cx);
+            return;
+        }
+
+        if form.target == FormTarget::View {
+            if let Some(id) = form.editing
+                && !name.is_empty()
+            {
+                if let Some(view) = self.library.view_mut(id) {
+                    view.name = name.clone();
+                }
+                // The working copy carries the name until the wall is saved.
+                if let Some(draft) = self.draft.as_mut() {
+                    draft.name = name;
+                }
+                self.save_library();
+            }
+            self.error = None;
+            cx.notify();
             return;
         }
 
@@ -694,6 +810,37 @@ fn row_menu(
         }))
 }
 
+/// A square icon button, used for the chrome controls.
+fn icon_button(
+    id: &'static str,
+    path: &'static str,
+    tooltip: &'static str,
+    cx: &mut Context<PlayerApp>,
+    on_click: impl Fn(&mut PlayerApp, &mut Window, &mut Context<PlayerApp>) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(22.0))
+        .flex_none()
+        .rounded(px(4.0))
+        .cursor_pointer()
+        .hover(|style| style.bg(cx.theme().secondary))
+        .tooltip(move |window, cx| {
+            gpui_component::tooltip::Tooltip::new(tooltip).build(window, cx)
+        })
+        .child(
+            svg()
+                .path(path)
+                .size(px(14.0))
+                .flex_none()
+                .text_color(cx.theme().muted_foreground),
+        )
+        .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
+}
+
 fn apply_theme(pref: ThemePref, window: &mut Window, cx: &mut Context<PlayerApp>) {
     match pref {
         ThemePref::System => Theme::sync_system_appearance(Some(window), cx),
@@ -750,8 +897,17 @@ impl gpui::Render for PlayerApp {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .child(self.render_sidebar(cx))
-            .child(self.render_wall(cx))
+            .when(!self.library.sidebar_hidden, |root| {
+                root.child(self.render_sidebar(cx))
+            })
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(self.render_chrome(cx))
+                    .child(self.render_wall(cx)),
+            )
             .when_some(self.form.as_ref(), |this, _| this.child(self.render_form(cx)))
     }
 }
@@ -1025,7 +1181,15 @@ impl PlayerApp {
                             .context_menu({
                                 let this = cx.entity();
                                 move |menu, _, _| {
-                                    menu.item(PopupMenuItem::new("Delete view").on_click({
+                                    menu.item(PopupMenuItem::new("Rename\u{2026}").on_click({
+                                        let this = this.clone();
+                                        move |_, window, app| {
+                                            this.update(app, |this, cx| {
+                                                this.open_view_form(id, window, cx)
+                                            });
+                                        }
+                                    }))
+                                    .item(PopupMenuItem::new("Delete wall").on_click({
                                         let this = this.clone();
                                         move |_, window, app| {
                                             this.update(app, |this, cx| {
@@ -1049,12 +1213,35 @@ impl PlayerApp {
             })
     }
 
+    /// A thin strip with the window controls that are not about a wall.
+    fn render_chrome(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let hidden = self.library.sidebar_hidden;
+
+        h_flex()
+            .flex_none()
+            .px_1()
+            .py_1()
+            .gap_1()
+            .items_center()
+            .child(icon_button(
+                "toggle-sidebar",
+                "icons/panel-left.svg",
+                if hidden { "Show sidebar" } else { "Hide sidebar" },
+                cx,
+                |this, _, cx| this.toggle_sidebar(cx),
+            ))
+            .child(div().flex_1())
+            .child(icon_button(
+                "toggle-fullscreen",
+                "icons/maximize.svg",
+                "Fullscreen",
+                cx,
+                |_, window, _| window.toggle_fullscreen(),
+            ))
+    }
+
     fn render_wall(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(view) = self
-            .library
-            .active_view
-            .and_then(|id| self.library.view(id))
-        {
+        if let Some(view) = self.active_grid() {
             return v_flex()
                 .flex_1()
                 .min_w_0()
@@ -1106,8 +1293,10 @@ impl PlayerApp {
             .into_any_element()
     }
 
-    /// Controls for the active view: its size, and a way back to the free wall.
+    /// Controls for the active wall. Locked by default: the size steppers and
+    /// the save/cancel pair only appear once it is unlocked.
     fn render_view_bar(&self, view: &GridView, cx: &mut Context<Self>) -> impl IntoElement {
+        let editing = self.editing();
         let stepper = |id: &'static str,
                        label: &'static str,
                        rows: isize,
@@ -1119,6 +1308,24 @@ impl PlayerApp {
                 .xsmall()
                 .on_click(cx.listener(move |this, _, _, cx| this.resize_view(rows, cols, cx)))
         };
+        let counter = |label: &'static str,
+                       value: usize,
+                       minus: (&'static str, isize, isize),
+                       plus: (&'static str, isize, isize),
+                       cx: &mut Context<Self>| {
+            h_flex()
+                .gap_1()
+                .items_center()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(label),
+                )
+                .child(stepper(minus.0, "\u{2212}", minus.1, minus.2, cx))
+                .child(div().text_xs().child(value.to_string()))
+                .child(stepper(plus.0, "+", plus.1, plus.2, cx))
+        };
 
         h_flex()
             .flex_none()
@@ -1129,42 +1336,94 @@ impl PlayerApp {
             .border_b_1()
             .border_color(cx.theme().border)
             .child(div().text_sm().child(view.name.clone()))
+            .when(editing, |bar| {
+                bar.child(
+                    div()
+                        .id("rename-view")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(20.0))
+                        .rounded(px(4.0))
+                        .cursor_pointer()
+                        .text_color(cx.theme().muted_foreground)
+                        .hover(|style| style.bg(cx.theme().secondary))
+                        .tooltip(|window, cx| {
+                            gpui_component::tooltip::Tooltip::new("Rename wall").build(window, cx)
+                        })
+                        .child(
+                            svg()
+                                .path("icons/pencil.svg")
+                                .size(px(13.0))
+                                .flex_none()
+                                .text_color(cx.theme().muted_foreground),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            if let Some(id) = this.library.active_view {
+                                this.open_view_form(id, window, cx);
+                            }
+                        })),
+                )
+            })
             .child(
-                h_flex()
-                    .gap_1()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("rows"),
-                    )
-                    .child(stepper("rows-minus", "\u{2212}", -1, 0, cx))
-                    .child(div().text_xs().child(view.rows.to_string()))
-                    .child(stepper("rows-plus", "+", 1, 0, cx)),
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if editing {
+                        "editing".to_string()
+                    } else {
+                        format!("{}\u{00d7}{}", view.rows, view.cols)
+                    }),
             )
-            .child(
-                h_flex()
-                    .gap_1()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("cols"),
-                    )
-                    .child(stepper("cols-minus", "\u{2212}", 0, -1, cx))
-                    .child(div().text_xs().child(view.cols.to_string()))
-                    .child(stepper("cols-plus", "+", 0, 1, cx)),
-            )
+            .when(editing, |bar| {
+                bar.child(counter(
+                    "rows",
+                    view.rows,
+                    ("rows-minus", -1, 0),
+                    ("rows-plus", 1, 0),
+                    cx,
+                ))
+                .child(counter(
+                    "cols",
+                    view.cols,
+                    ("cols-minus", 0, -1),
+                    ("cols-plus", 0, 1),
+                    cx,
+                ))
+            })
             .child(div().flex_1())
-            .child(
-                Button::new("close-view")
-                    .label("Close view")
-                    .ghost()
-                    .xsmall()
-                    .on_click(cx.listener(|this, _, window, cx| this.close_view(window, cx))),
-            )
+            .when(!editing, |bar| {
+                bar.child(
+                    Button::new("edit-view")
+                        .label("Edit")
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, _, cx| this.begin_edit(cx))),
+                )
+                .child(
+                    Button::new("close-view")
+                        .label("Close")
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, window, cx| this.close_view(window, cx))),
+                )
+            })
+            .when(editing, |bar| {
+                bar.child(
+                    Button::new("cancel-edit")
+                        .label("Cancel")
+                        .outline()
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, window, cx| this.cancel_edit(window, cx))),
+                )
+                .child(
+                    Button::new("save-edit")
+                        .label("Save")
+                        .primary()
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, _, cx| this.commit_edit(cx))),
+                )
+            })
     }
 
     /// Cells are positioned as fractions of the wall, so a cell can span rows
@@ -1208,9 +1467,11 @@ impl PlayerApp {
                             div()
                                 .size_full()
                                 .rounded(px(6.0))
-                                .border_1()
-                                .border_dashed()
-                                .border_color(cx.theme().border)
+                                .when(self.editing(), |slot| {
+                                    slot.border_1()
+                                        .border_dashed()
+                                        .border_color(cx.theme().border)
+                                })
                                 .into_any_element(),
                         )
                         .into_any_element(),
@@ -1245,23 +1506,30 @@ impl PlayerApp {
             .h(relative(h))
             .p_1()
             .flex()
-            .drag_over::<DraggedTile>(|mut style, _, _, cx| {
-                style.background = Some(cx.theme().drop_target.into());
-                style
+            // A locked wall takes no drops at all.
+            .when(self.editing(), |cell| {
+                cell.drag_over::<DraggedTile>(|mut style, _, _, cx| {
+                    style.background = Some(cx.theme().drop_target.into());
+                    style
+                })
+                .drag_over::<DraggedNode>(|mut style, _, _, cx| {
+                    style.background = Some(cx.theme().drop_target.into());
+                    style
+                })
+                .on_drop::<DraggedTile>(cx.listener(
+                    move |this, dragged: &DraggedTile, window, cx| {
+                        this.place_in_view(dragged.id, row, col, window, cx);
+                    },
+                ))
+                .on_drop::<DraggedNode>(cx.listener(
+                    move |this, dragged: &DraggedNode, window, cx| {
+                        let id = dragged.id;
+                        if this.library.connection(id).is_some() {
+                            this.place_in_view(id, row, col, window, cx);
+                        }
+                    },
+                ))
             })
-            .drag_over::<DraggedNode>(|mut style, _, _, cx| {
-                style.background = Some(cx.theme().drop_target.into());
-                style
-            })
-            .on_drop::<DraggedTile>(cx.listener(move |this, dragged: &DraggedTile, window, cx| {
-                this.place_in_view(dragged.id, row, col, window, cx);
-            }))
-            .on_drop::<DraggedNode>(cx.listener(move |this, dragged: &DraggedNode, window, cx| {
-                let id = dragged.id;
-                if this.library.connection(id).is_some() {
-                    this.place_in_view(id, row, col, window, cx);
-                }
-            }))
     }
 
     /// A cell whose connection has been deleted from the library.
@@ -1286,7 +1554,6 @@ impl PlayerApp {
         let name = stream.player.connection.name.clone();
         let id = stream.id;
         let fps = stream.player.fps();
-
         let status_color = match status {
             Status::Playing => cx.theme().success,
             Status::Connecting => cx.theme().muted_foreground,
@@ -1294,7 +1561,26 @@ impl PlayerApp {
             Status::Failed(_) => cx.theme().danger,
         };
 
-        v_flex()
+        let hovered = self.hovered_tile == Some(id);
+
+        div()
+            .id(("tile", id.as_u128() as usize))
+            .on_hover(cx.listener(move |this, entered: &bool, _, cx| {
+                // The next tile's enter arrives before this one's leave, so a
+                // tile may only clear the hover while it still owns it.
+                let next = if *entered {
+                    Some(id)
+                } else if this.hovered_tile == Some(id) {
+                    None
+                } else {
+                    return;
+                };
+                if this.hovered_tile != next {
+                    this.hovered_tile = next;
+                    cx.notify();
+                }
+            }))
+            .relative()
             .flex_1()
             .min_w_0()
             .min_h_0()
@@ -1304,15 +1590,44 @@ impl PlayerApp {
             .border_1()
             .border_color(cx.theme().border)
             .bg(gpui::black())
-            .child(
+            // The picture owns the whole tile; the header floats over it.
+            .child(match stream.texture.clone() {
+                Some(texture) => div()
+                    .size_full()
+                    .overflow_hidden()
+                    .child(
+                        img(texture)
+                            .size_full()
+                            // Contain: scaled as large as fits, never
+                            // distorted and never cropped.
+                            .object_fit(ObjectFit::Contain),
+                    )
+                    .into_any_element(),
+                None => v_flex()
+                    .size_full()
+                    .items_center()
+                    .justify_center()
+                    .p_2()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(status.message().to_string())
+                    .into_any_element(),
+            })
+            .when(hovered, |tile| tile.child(
                 h_flex()
                     .id(("tile-header", id.as_u128() as usize))
-                    .flex_none()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
                     .px_2()
                     .py_1()
                     .gap_2()
                     .justify_between()
-                    .bg(cx.theme().secondary)
+                    // Shaded rather than solid, so the picture still reads
+                    // through it.
+                    .bg(gpui::black().opacity(0.55))
+                    .text_color(gpui::white())
                     .on_drag(
                         DraggedTile {
                             id,
@@ -1348,33 +1663,14 @@ impl PlayerApp {
                     )
                     .child(
                         Button::new(("close", id.as_u128() as usize))
-                            .label("✕")
+                            .label("\u{2715}")
                             .ghost()
                             .xsmall()
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.close_stream(id, window, cx)
                             })),
                     ),
-            )
-            .child(match stream.texture.clone() {
-                Some(texture) => div()
-                    .flex_1()
-                    .min_h_0()
-                    .h_full()
-                    .overflow_hidden()
-                    .child(img(texture).size_full().object_fit(ObjectFit::Contain))
-                    .into_any_element(),
-                None => v_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .items_center()
-                    .justify_center()
-                    .p_2()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(status.message().to_string())
-                    .into_any_element(),
-            })
+            ))
     }
 
     fn render_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1382,7 +1678,7 @@ impl PlayerApp {
             return div().into_any_element();
         };
         let editing = form.editing.is_some();
-        let is_group = form.group;
+        let is_group = form.target != FormTarget::Connection;
         let transport = form.transport;
 
         let field = |label: &'static str,
@@ -1436,6 +1732,7 @@ impl PlayerApp {
                     .border_color(cx.theme().border)
                     .bg(cx.theme().background)
                     .child(div().text_lg().child(match (is_group, editing) {
+                        (true, _) if form.target == FormTarget::View => "Rename wall",
                         (true, _) => "Rename group",
                         (false, true) => "Edit connection",
                         (false, false) => "New connection",

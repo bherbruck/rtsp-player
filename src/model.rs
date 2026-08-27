@@ -271,6 +271,9 @@ pub struct Library {
     pub theme: ThemePref,
     #[serde(default)]
     pub layout: LayoutMode,
+    /// Collapsed sidebar, so a wall can fill the window.
+    #[serde(default)]
+    pub sidebar_hidden: bool,
     /// Saved walls, each a fixed grid with connections at chosen positions.
     #[serde(default)]
     pub views: Vec<GridView>,

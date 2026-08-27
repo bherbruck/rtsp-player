@@ -173,23 +173,32 @@ you use anywhere else.
   group cannot be dropped into itself.
 - **Add stream / Group** — same thing from the toolbar, adding inside whatever
   is selected.
+- **Hover a tile** — its header fades in over the picture with the name, frame
+  rate and a close button. Nothing covers the video otherwise.
 - **Drag a tile by its header** — drop it on another tile to reorder the grid,
-  or onto a cell of a saved view to move it there.
+  or onto a cell of an unlocked wall to move it there.
 - **✕ on a tile** — closes that stream.
 - **Theme button** — cycles Auto (follows the desktop), Light and Dark. Auto
   keeps following the system if it changes while the app is open.
+- **Sidebar and fullscreen** — the two icons above the wall collapse the
+  sidebar and toggle fullscreen, for using the whole screen as a monitor.
 
 ### Saved views
 
 A view is a fixed grid with cameras at chosen positions, listed under the tree.
 
-- **Save wall** — snapshots whatever is playing into a new view.
-- **Click a view** — loads it, playing exactly its cameras at their positions.
-- **rows / cols** — resize the grid; placements outside the new size are
-  dropped.
+Walls are **locked** until you unlock them, and edits are held until you save,
+so watching a wall can never quietly rewrite it.
+
+- **Save wall** — snapshots whatever is playing into a new wall.
+- **Click a wall** — loads it, playing exactly its cameras at their positions.
+- **Edit** — unlocks it. The rows and cols steppers, the pencil beside the
+  name and cell drops only work while unlocked.
+- **Save / Cancel** — Save writes the wall to the config file; Cancel throws
+  the changes away and replays the saved one. Nothing is written before that.
 - **Drag onto a cell** — a tree row or another tile drops into that position,
   evicting whatever was there.
-- **Right-click a view** — Delete.
+- **Right-click a wall** — Rename or Delete.
 
 Cells can span rows and columns, which the grid honours but has no button for
 yet; set `row_span` / `col_span` in the config file.
