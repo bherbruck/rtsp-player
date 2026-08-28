@@ -196,16 +196,6 @@ async fn session(connection: &Connection, shared: &Arc<Shared>) -> anyhow::Resul
     // queue that would show ever-staler video.
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
 
-    // Prime the decoder with the VPS/SPS/PPS from the SDP, so it is configured
-    // even if the server never sends them in-band.
-    if let Some(ParametersRef::Video(params)) = demuxed.streams()[video_stream].parameters() {
-        let extra = params.extra_data().to_vec();
-        if !extra.is_empty() {
-            trace!("priming decoder with {} bytes of parameter sets", extra.len());
-            let _ = tx.try_send(extra);
-        }
-    }
-
     let decode_shared = shared.clone();
     let decode_thread = std::thread::Builder::new()
         .name("rtsp-decode".into())
@@ -274,6 +264,9 @@ async fn pump(
 ) -> anyhow::Result<()> {
     let mut seen_key_frame = false;
     let mut waiting_for_key = 0usize;
+    // Parameter sets last handed to the decoder, so they are only resent when
+    // they actually change.
+    let mut sent_params: Vec<u8> = Vec::new();
     loop {
         if shared.stop.load(Ordering::Relaxed) {
             return Ok(());
@@ -297,13 +290,14 @@ async fn pump(
         if frame.stream_id() != video_stream {
             continue;
         }
-        // Feeding a decoder mid-GOP produces green garbage, so wait for an IDR
-        // first. Not every server flags them correctly though, so give up
-        // waiting after a while and let the decoder sort itself out rather than
-        // sitting silent forever.
+        // Feeding a decoder mid-GOP produces green garbage, so wait for a key
+        // frame first. Retina only flags IDRs, not the CRAs that a lot of HEVC
+        // keys on, so count fresh parameter sets as a key frame too: they
+        // accompany an IRAP. Some servers flag neither, so give up waiting
+        // after a while rather than sitting silent forever.
         if !seen_key_frame {
             waiting_for_key += 1;
-            if frame.is_random_access_point() {
+            if frame.is_random_access_point() || frame.has_new_parameters() {
                 seen_key_frame = true;
             } else if waiting_for_key < KEY_FRAME_WAIT {
                 continue;
@@ -313,7 +307,24 @@ async fn pump(
             }
         }
 
-        match tx.try_send(frame.into_data()) {
+        let mut data = frame.into_data();
+
+        // Retina strips in-band VPS/SPS/PPS and only puts them back on access
+        // units it flags as random access points, so a CRA-keyed stream would
+        // never carry them and the decoder would reject every slice. Splice
+        // them in from the stream's parameters whenever they change instead.
+        if let Some(ParametersRef::Video(params)) = demuxed.streams()[video_stream].parameters() {
+            let extra = params.extra_data();
+            if !extra.is_empty() && extra != sent_params {
+                trace!("splicing in {} bytes of parameter sets", extra.len());
+                sent_params = extra.to_vec();
+                let mut with_params = sent_params.clone();
+                with_params.append(&mut data);
+                data = with_params;
+            }
+        }
+
+        match tx.try_send(data) {
             Ok(()) => {}
             // Decoder is behind. Dropping is the right call for live video.
             Err(TrySendError::Full(_)) => {}
